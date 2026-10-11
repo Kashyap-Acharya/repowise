@@ -21,17 +21,20 @@ from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 from ..worth import dormant
+from .cold_paths import is_cold_path
 
 FixSafety = Literal["proven", "advisory"]
 OpportunityConfidence = Literal["high", "medium", "low"]
 # ``expected``: the repetition is real and there is nothing to change, either
 # by its nature or for a reason :func:`expected_reason` reads off the group
-# (``gated_off``: a constant-false flag switches the function off).
+# (``gated_off``: a constant-false flag switches the function off;
+# ``cold_path``: it runs once per deploy, boot or incident;
+# ``bounded_loop``: the loop runs a fixed number of times).
 ActionabilityState = Literal["plan_ready", "advisory", "investigate", "expected"]
 
-#: Reasons :func:`expected_reason` gives, in precedence order. The default
-#: queue counts each under its own name rather than as ``expected``.
-EXPECTED_REASONS: tuple[str, ...] = ("gated_off",)
+#: Reasons :func:`expected_reason` gives that the default queue counts under
+#: their own name, in precedence order; ``bounded_loop`` counts as ``expected``.
+EXPECTED_REASONS: tuple[str, ...] = ("gated_off", "cold_path")
 
 # Refusals that are facts about the code, not missing proofs: nothing to investigate.
 _EXPECTED_REFUSALS = frozenset({"inherent_to_boundary", "loop_already_chunked"})
@@ -55,6 +58,14 @@ CONCURRENCY_SENSITIVE_BOUNDARIES = frozenset({"db", "network"})
 # under its lock, and a launcher spawns its process once under it. Moving that
 # I/O out of the lock reintroduces the race the lock prevents.
 LOCK_SERIALIZED_BOUNDARIES = frozenset({"filesystem", "subprocess"})
+
+#: What a boundary's call is named in prose ("a database call").
+BOUNDARY_NOUN = {
+    "db": "database",
+    "filesystem": "file system",
+    "network": "network",
+    "subprocess": "subprocess",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -289,15 +300,23 @@ def assess_fix(
     return FixAssessment(None, ("supported_strategy_for_marker",))
 
 
-def expected_reason(members: Sequence[Any]) -> str | None:
+def expected_reason(members: Sequence[Any], magnitude: str | None = None) -> str | None:
     """Why a group needs no change whatever its strategy, or ``None``.
 
     ``gated_off``: every member sits in a function a constant-false flag in
-    its own file switches off. Reasons are checked in precedence order.
+    its own file switches off. ``cold_path``: every loop owner is named for a
+    migration, startup, shutdown or crash recovery (:mod:`.cold_paths`), so it
+    runs once per deploy, boot or incident. ``bounded_loop``: the group's loop
+    *magnitude* is proven bounded, so its cost does not grow. Reasons are
+    checked in precedence order.
     """
-    if members and all(dormant(facts.details) for facts in members):
+    if not members:
+        return None
+    if all(dormant(facts.details) for facts in members):
         return "gated_off"
-    return None
+    if all(is_cold_path(facts.file_path, facts.function_name) for facts in members):
+        return "cold_path"
+    return "bounded_loop" if magnitude == "bounded" else None
 
 
 def actionability(
@@ -348,6 +367,7 @@ def actionability(
 __all__ = [
     "BATCHABLE_BOUNDARIES",
     "BATCHABLE_MARKERS",
+    "BOUNDARY_NOUN",
     "LOCK_SERIALIZED_BOUNDARIES",
     "Actionability",
     "ActionabilityState",

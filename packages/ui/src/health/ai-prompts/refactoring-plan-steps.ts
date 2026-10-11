@@ -11,6 +11,7 @@ import {
   extractClassGroups,
   extractHelperOccurrences,
   extractMethodPlan,
+  HELPER_NAME_PLACEHOLDER,
   helperSite,
   moveTarget,
   splitGroups,
@@ -66,13 +67,29 @@ function extractMethodSteps(plan: RefactoringPlan): string {
   if (!em.span) return "Extract the indicated slice into a helper method.";
   const params = em.params.length ? em.params.join(", ") : "(none)";
   const returns = em.returns.length ? em.returns.join(", ") : "(nothing)";
-  const name = em.suggested_name ?? "a clearly named helper";
+  const name = em.suggested_name ?? HELPER_NAME_PLACEHOLDER;
+  const rendered = [
+    ...(em.signature_text ? [`- **New helper:** \`${em.signature_text}\``] : []),
+    ...(em.return_text ? [`- **End the helper with:** \`${em.return_text}\``] : []),
+    ...(em.call_site
+      ? [`- **Replace lines ${em.span.start}–${em.span.end} with:** \`${em.call_site.new_text}\``]
+      : []),
+    ...em.notes.map((note) => `- **Note:** ${note}`),
+  ];
   return [
-    `Extract lines ${em.span.start}–${em.span.end} of \`${plan.target_symbol}\` into ${name}:`,
+    `Extract lines ${em.span.start}–${em.span.end} of \`${plan.target_symbol}\` into \`${name}\`${
+      em.suggested_name ? "" : " (name it for what the lines do)"
+    }:`,
     "",
+    ...rendered,
     `- **Parameters (in):** ${params}`,
     `- **Returns (out):** ${returns}`,
     ...(em.needs_async ? ["- **Async:** the span awaits, so declare the helper async and await its call"] : []),
+    ...(em.kind === "method"
+      ? [
+          `- **Method:** the span ${em.uses_receiver ? "uses" : "may use"} its object, so make the helper a method of the same object`,
+        ]
+      : []),
     "",
     "Move exactly those lines into the new helper in the same scope, pass the parameters above, return the value(s) above, and replace the original lines with a single call to it. Preserve behavior exactly: change nothing outside the span and that one call site.",
   ].join("\n");

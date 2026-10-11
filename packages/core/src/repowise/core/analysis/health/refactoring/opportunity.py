@@ -33,6 +33,11 @@ none of the cycles it named were worth cutting. It rides along as evidence the
 same way, so it is never a numbered step, never leads, and never reaches Fix
 first; the plan stays in the plan inventory.
 
+**An unnamed group is a design question, not a step.** A ``split_file`` or
+``extract_class`` plan with a group it cannot name says what to separate but
+not what the result is (``needs_design``). It rides along as evidence the same
+way, until the group has a name.
+
 **A finding is recovered once.** A step names the findings its own target
 answers: the source biomarker's findings whose span it covers, and for a
 named finding only the one on the same symbol. Two steps answering one
@@ -47,12 +52,13 @@ them in here would publish the same work twice under two ids.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from ...finding_registry import excluded_types
-from ..refactoring_summary import ADVISORY_TYPES
+from ..effort import EFFORT_ORDER
+from ..refactoring_summary import ADVISORY_TYPES, needs_design
 from ..rows import field
 from .extract_helper import ACTIVE_CO_CHANGE
 from .identity import REFACTORING_MODEL_VERSION, assign_public_ids, stable_id
@@ -101,8 +107,6 @@ _UNORDERED = len(STEP_ORDER)
 # finds a symbol by name - but a wrong *file* sends them looking in the wrong
 # place entirely.
 _RELOCATING_TYPES = frozenset({"split_file", "extract_class", "move_method"})
-
-_EFFORT_ORDER = ("S", "M", "L", "XL")
 
 # Evidence restates the plan's own signals; these three are read-model
 # additions the plan layer already publishes elsewhere.
@@ -242,7 +246,7 @@ def is_standalone_clone(suggestion: RefactoringSuggestion) -> bool:
 
 
 def _is_step(suggestion: RefactoringSuggestion) -> bool:
-    if suggestion.refactoring_type in ADVISORY_TYPES:
+    if suggestion.refactoring_type in ADVISORY_TYPES or needs_design(suggestion):
         return False
     if suggestion.refactoring_type == "extract_helper":
         return is_standalone_clone(suggestion)
@@ -291,8 +295,8 @@ def _aggregate_effort(steps: Sequence[OpportunityStep]) -> str:
     label no detector could emit. Total work enters the ranking through
     ``step_cost`` instead, where it belongs.
     """
-    present = [step.effort_bucket for step in steps if step.effort_bucket in _EFFORT_ORDER]
-    return max(present, key=_EFFORT_ORDER.index) if present else "M"
+    present = [step.effort_bucket for step in steps if step.effort_bucket in EFFORT_ORDER]
+    return max(present, key=EFFORT_ORDER.index) if present else "M"
 
 
 def opportunity_kernel(step_plan_ids: Sequence[str], file_path: str) -> tuple[Any, ...]:
@@ -368,6 +372,7 @@ def _step_of(
     plan_id: str,
     relocated_by: str | None,
     findings: Sequence[Any] | None,
+    governed: Collection[str] | None = None,
 ) -> OpportunityStep:
     finding_ids = None
     if findings is not None and any(field(f, "public_id") for f in findings):
@@ -388,7 +393,9 @@ def _step_of(
         impact_delta=float(suggestion.impact_delta or 0.0),
         source_biomarker=suggestion.source_biomarker,
         relocated_by=relocated_by,
-        applicability=classify_step(suggestion),
+        applicability=classify_step(
+            suggestion, governed=None if governed is None else plan_id in governed
+        ),
         finding_ids=finding_ids,
     )
 
@@ -410,6 +417,7 @@ def _evidence_of(suggestion: RefactoringSuggestion, plan_id: str) -> Opportunity
 def _sequence(
     step_rows: Sequence[tuple[RefactoringSuggestion, str]],
     findings: Sequence[Any] | None,
+    governed: Collection[str] | None = None,
 ) -> list[OpportunityStep]:
     """Build the steps in execution order, marking the ones a move displaces.
 
@@ -422,7 +430,7 @@ def _sequence(
     steps: list[OpportunityStep] = []
     relocated_by: str | None = None
     for suggestion, plan_id in step_rows:
-        steps.append(_step_of(suggestion, plan_id, relocated_by, findings))
+        steps.append(_step_of(suggestion, plan_id, relocated_by, findings, governed))
         if suggestion.refactoring_type in _RELOCATING_TYPES:
             relocated_by = plan_id
     return steps
@@ -433,6 +441,7 @@ def _compose_one(
     members: Sequence[tuple[RefactoringSuggestion, str]],
     primary_biomarker: str | None,
     findings: Sequence[Any] | None,
+    governed: Collection[str] | None = None,
 ) -> RefactoringOpportunity | None:
     ordered = sorted(members, key=_member_sort_key)
     step_rows = [row for row in ordered if _is_step(row[0])]
@@ -441,7 +450,7 @@ def _compose_one(
         # own; there is simply no composed refactoring to publish for this file.
         return None
 
-    steps = tuple(_sequence(step_rows, findings))
+    steps = tuple(_sequence(step_rows, findings, governed))
     evidence = tuple(
         _evidence_of(suggestion, plan_id)
         for suggestion, plan_id in ordered
@@ -504,6 +513,7 @@ def compose_opportunities(
     *,
     primary_biomarker_by_file: Mapping[str, str] | None = None,
     findings: Iterable[Any] | None = None,
+    governed: Collection[str] | None = None,
 ) -> list[RefactoringOpportunity]:
     """Fold plans into one ranked opportunity per file.
 
@@ -521,6 +531,10 @@ def compose_opportunities(
     attaches each step's ``finding_ids`` and credits a finding once when
     several steps answer it; omitting them leaves both unknown and sums every
     step's own impact.
+
+    *governed* are the plan ids an accepted decision governs, found once at
+    finalize; each of those steps is a judgment call (:func:`.preconditions.classify_step`).
+    Omitting it leaves governance unknown on every step, never "not governed".
 
     A plan whose ``source_biomarker`` the finding registry withholds is left
     out, as a step and as evidence; the plan row itself stays stored.
@@ -547,6 +561,7 @@ def compose_opportunities(
                 by_file[file_path],
                 leads.get(file_path),
                 None if findings_by_file is None else findings_by_file.get(file_path, []),
+                governed,
             )
         )
         is not None

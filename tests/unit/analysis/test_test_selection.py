@@ -654,6 +654,24 @@ def test_go_gets_each_package_directory_once() -> None:
     assert runner_args(sel, "go") == [".", "./pkg/x"]
 
 
+def test_go_keeps_ranked_order_of_package_directories() -> None:
+    # --prioritize rewrites test_files in likeliest-to-fail order; the Go
+    # runner must keep that order instead of printing packages alphabetically.
+    sel = _subset(files=("zeta/z_test.go", "alpha/a_test.go", "mid/m_test.go"))
+    assert runner_args(sel, "go") == ["./zeta", "./alpha", "./mid"]
+
+
+def test_go_appends_changed_packages_not_covered_by_test_files() -> None:
+    sel = Selection(
+        run_all=False,
+        reasons=(),
+        tests=("zeta/z_test.go",),
+        test_files=("zeta/z_test.go",),
+        packages=("pkg/q", "zeta"),
+    )
+    assert runner_args(sel, "go") == ["./zeta", "./pkg/q"]
+
+
 def test_go_runs_the_package_of_every_changed_go_file_with_tests() -> None:
     """Same-package tests import nothing, so the graph alone can miss them."""
     tiers = _tiers(
@@ -875,6 +893,15 @@ def test_explain_says_what_selected_a_test_or_that_nothing_did() -> None:
         ["Every test runs:", "uv.lock changed: dependencies can change any test."],
     )
 
+
+
+def test_explain_names_a_conftest_import_check() -> None:
+    from repowise.core.analysis.test_selection import explain_test
+
+    tiers = _tiers(inferred=[_inferred("src/a.py", "tests/test_a.py", "conftest-import-check")])
+    selected, lines = explain_test(_select(["src/a.py"], tiers), "tests/test_a.py")
+    assert selected
+    assert "this test is that conftest's import check" in lines[0]
 
 def test_a_test_named_module_pytest_does_not_collect_is_not_runnable() -> None:
     """``core/test_paths.py`` is test-shaped, but a bare pytest never collects it."""

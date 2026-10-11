@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from .base import BaseDefUseDialect, Occurrence, StatementDefUse
+from .base import BaseDefUseDialect, Occurrence, Receiver, StatementDefUse
 
 if TYPE_CHECKING:
     from tree_sitter import Node
@@ -33,6 +33,9 @@ _AUG_KINDS = frozenset({"augmented_assignment_expression"})
 _UPDATE_KINDS = frozenset({"update_expression"})  # ``x++`` / ``--x``
 _DECL_KINDS = frozenset({"lexical_declaration", "variable_declaration"})
 _DECLARATOR = "variable_declarator"
+# ``var`` hoists to the function scope, so it creates no block-scoped binding.
+_VAR_DECL = "variable_declaration"
+_VAR = "var"
 # Destructuring patterns and their parts.
 _ARRAY_PATTERN = "array_pattern"
 _OBJECT_PATTERN = "object_pattern"
@@ -54,11 +57,37 @@ _SCOPE_BOUNDARIES = frozenset(
         "method_definition",
     }
 )
+_THIS = frozenset({"this"})
+
+
+_OPENERS, _CLOSERS = "([{<", ")]}>"
+
+
+def union_arms(typ: str) -> list[str]:
+    """The arms of a TypeScript union type written as *typ*, split on ``|``
+    outside brackets (``Map<string, A | B> | undefined`` has two)."""
+    arms, depth, start = [], 0, 0
+    for n, ch in enumerate(typ):
+        if ch in _OPENERS:
+            depth += 1
+        elif ch in _CLOSERS and typ[n - 1 : n + 1] != "=>":
+            depth -= 1
+        elif ch == "|" and depth == 0:
+            arms.append(typ[start:n].strip())
+            start = n + 1
+    arms.append(typ[start:].strip())
+    return [a for a in arms if a]
+
+
+def _is_static(method: Node) -> bool:
+    return any(c.type == "static" for c in method.children)
 
 
 class TsJsDefUseDialect(BaseDefUseDialect):
     language = "typescript"
     member_access_kinds = frozenset({"member_expression"})
+    receiver_write_kinds = _ASSIGN_KINDS | _AUG_KINDS | _UPDATE_KINDS
+    type_holder_kinds = frozenset({"required_parameter", "optional_parameter", "variable_declarator"})
     keyword_kinds = frozenset()  # object-property keys are not variable reads.
     # ``shorthand_property_identifier`` is an object-literal read (``{ days }``
     # reads the local ``days``). Its ``_pattern`` twin is the destructuring
@@ -90,6 +119,17 @@ class TsJsDefUseDialect(BaseDefUseDialect):
             self._process(node, defs, uses)
         return StatementDefUse(defs=tuple(defs), uses=tuple(uses))
 
+    def declared_type(self, name: Node) -> str | None:
+        """The base rule, plus ``| undefined`` for an optional parameter
+        (``x?: T`` holds ``T | undefined`` until something narrows it)."""
+        typ = super().declared_type(name)
+        if typ is None or name.parent is None or name.parent.type != "optional_parameter":
+            return typ
+        arms = union_arms(typ)
+        if "undefined" in arms:
+            return typ
+        return f"({typ}) | undefined" if len(arms) == 1 and "=>" in typ else f"{typ} | undefined"
+
     def parameter_defs(self, fn_node: Node) -> tuple[Occurrence, ...]:
         params_node = fn_node.child_by_field_name("parameters")
         if params_node is None:
@@ -103,6 +143,23 @@ class TsJsDefUseDialect(BaseDefUseDialect):
             self._targets(pattern, out, sink)
         return tuple(out)
 
+    def _own_receiver(self, fn_node: Node, lmap: LanguageNodeMap) -> Receiver | None:
+        """``this``, bound when it is a class instance: a class method, or an
+        arrow function (which takes ``this`` from where it is written) inside
+        one or in a class field. An object-literal method or a plain function
+        gets ``this`` from its caller, so a helper method cannot share it. In
+        a ``static`` method ``this`` is the class, not an instance: judged
+        unbound too, the conservative call."""
+        node = fn_node
+        while node is not None and node.type not in lmap.class_kinds:
+            if node.type in _SCOPE_BOUNDARIES and node.type != "arrow_function":
+                parent = node.parent
+                in_class = node.type == "method_definition" and parent is not None
+                bound = in_class and parent.type == "class_body" and not _is_static(node)
+                return self._receiver(_THIS, bound=bound)
+            node = node.parent
+        return self._receiver(_THIS, bound=node is not None)
+
     # -- head (loop clause / if condition) ------------------------------------
 
     def _head(
@@ -112,7 +169,11 @@ class TsJsDefUseDialect(BaseDefUseDialect):
             left = node.child_by_field_name("left")
             right = node.child_by_field_name("right")
             if left is not None or right is not None:  # for-of / for-in binder
+                start = len(defs)
                 self._targets(left, defs, uses)
+                kind = node.child_by_field_name("kind")
+                if kind is not None and kind.type != _VAR:  # ``const`` / ``let``
+                    self._loop_scoped(defs, start)
                 self._process(right, defs, uses)
                 return
             # C-style for / while / do: initializer + condition + increment.
@@ -151,7 +212,7 @@ class TsJsDefUseDialect(BaseDefUseDialect):
                     continue
                 start = len(defs)
                 self._targets(declarator.child_by_field_name("name"), defs, uses)
-                self._declare(defs, start, declarator)
+                self._declare(defs, start, declarator, binds=t != _VAR_DECL)
                 self._process(declarator.child_by_field_name("value"), defs, uses)
             return
         if t in self.member_access_kinds:

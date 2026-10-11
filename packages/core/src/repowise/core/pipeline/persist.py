@@ -9,7 +9,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
@@ -1072,6 +1072,38 @@ class _FileLiveness:
         return path in self._tracked
 
 
+def path_liveness(repo_path: Any) -> Callable[[str], bool] | None:
+    """Whether a repo-relative path is still on disk or tracked by git; ``None``
+    without a checkout to ask, so no caller reads a path as deleted on no evidence."""
+    return _FileLiveness(repo_path).is_live if repo_path else None
+
+
+async def _resolve_plans_of_deleted_files(
+    session: Any, repo_id: str, dead: Callable[[set[str], str], list[str]], liveness: Any
+) -> None:
+    from sqlalchemy import select
+
+    from repowise.core.persistence.crud import PayoffContext, upsert_refactoring_suggestions
+    from repowise.core.persistence.models import RefactoringSuggestion
+
+    live_plan_paths = await session.execute(
+        select(RefactoringSuggestion.file_path)
+        .where(
+            RefactoringSuggestion.repository_id == repo_id,
+            RefactoringSuggestion.status.in_(("open", "acknowledged")),
+        )
+        .distinct()
+    )
+    gone = dead(set(live_plan_paths.scalars().all()), "refactoring_suggestions")
+    if gone:
+        payoff = PayoffContext(
+            fact_rows=None,
+            is_live=liveness.is_live,
+            commit=await _analyzed_commit(session, repo_id),
+        )
+        await upsert_refactoring_suggestions(session, repo_id, [], file_paths=gone, payoff=payoff)
+
+
 async def prune_deleted_file_rows(
     session: Any,
     repo_id: str,
@@ -1121,6 +1153,7 @@ async def prune_deleted_file_rows(
     # partial dead-code analysis has already loaded the module (13.7 ms when
     # it has not, measured cold after the CLI modules are up).
     from repowise.core.analysis.dead_code.analyzer import _is_synthetic_node
+    from repowise.core.persistence.crud.analysis.function_facts import delete_file_rows
     from repowise.core.persistence.models import (
         DeadCodeFinding,
         DocDriftFinding,
@@ -1218,13 +1251,18 @@ async def prune_deleted_file_rows(
     await _prune_table(WikiSymbol, WikiSymbol.file_path, "wiki_symbols")
     await _prune_table(SecurityFinding, SecurityFinding.file_path, "security_findings")
     await _prune_table(DeadCodeFinding, DeadCodeFinding.file_path, "dead_code_findings")
+    # Plans are resolved, not deleted, so a held id keeps answering. A scoped
+    # run never names a deleted file (or a renamed file's old path) again, so
+    # this is the one place they resolve. Before the facts below go: those are
+    # the target's measures the payoff keeps.
+    await _resolve_plans_of_deleted_files(session, repo_id, _dead, liveness)
+    # Keyed on the symbol: a deleted file's rows are one key range of the id.
+    await delete_file_rows(session, repo_id, dead_paths)
     # Keyed on the DOCUMENT. The incremental drift pass scopes its write to the
     # documents it read, so a deleted one is never in scope and its rows would
     # outlive the file without this. ``_FileLiveness`` asks disk and
     # ``git ls-files`` rather than the parse, so a ``.md`` path is judged
-    # correctly here. Note the LLM-regenerating update path never reaches this
-    # function, so drift rows for a document deleted there wait for a reindex,
-    # as dead-code and health rows already do.
+    # correctly here.
     await _prune_table(DocDriftFinding, DocDriftFinding.file_path, "doc_drift_findings")
     # On the document only. A reference to a deleted *target* is drift, not a
     # dead row: the next pass re-resolves it into a finding, and pruning by
@@ -1738,8 +1776,18 @@ async def replace_git_history(
     repo_id: str,
     git_meta_map: dict[str, dict],
     git_summary: Any,
+    *,
+    keep_commit_health: bool = False,
 ) -> None:
-    """Replace every history-derived row from one authoritative Git walk."""
+    """Replace every history-derived row from one authoritative Git walk.
+
+    ``keep_commit_health`` keeps the per-commit health rows. A walk that only
+    re-reads the same window under new rules leaves each commit's code, so its
+    health is still right, and the capped ``refresh_commit_health`` could not
+    rebuild rows past its budget. Those rows key on ``(repository_id, sha)``
+    alone, so nothing dangles; unreachable shas are pruned by the update's
+    orphan sweep.
+    """
     from types import SimpleNamespace
 
     from sqlalchemy import delete
@@ -1756,14 +1804,8 @@ async def replace_git_history(
     # Function blame describes the current source tree and is produced by the
     # health pass, not by persist_git. Preserve it across a history-window
     # replacement; scope reconciliation prunes entries for excluded files.
-    for model in (
-        FixEvent,
-        GitCommit,
-        GitCommitFile,
-        GitCommitHealthDelta,
-        GitCommitHealthFinding,
-        GitMetadata,
-    ):
+    health = () if keep_commit_health else (GitCommitHealthDelta, GitCommitHealthFinding)
+    for model in (FixEvent, GitCommit, GitCommitFile, *health, GitMetadata):
         await session.execute(delete(model).where(model.repository_id == repo_id))
     await persist_git(
         SimpleNamespace(
@@ -1781,10 +1823,18 @@ async def persist_git_refresh(
     git_meta_map: dict[str, dict],
     git_decay_map: dict[str, dict] | None,
     full_git_summary: Any | None,
+    *,
+    keep_commit_health: bool = False,
 ) -> None:
     """Persist either a full history replacement or an incremental refresh."""
     if full_git_summary is not None:
-        await replace_git_history(session, repo_id, git_meta_map, full_git_summary)
+        await replace_git_history(
+            session,
+            repo_id,
+            git_meta_map,
+            full_git_summary,
+            keep_commit_health=keep_commit_health,
+        )
         return
 
     from sqlalchemy import select
@@ -1892,6 +1942,7 @@ async def save_full_health_report(
     health_report: Any,
     *,
     analyzed_commit: str | None,
+    repo_path: Any = None,
 ) -> None:
     """Full-replace a repository's health rows and everything derived from them.
 
@@ -1903,14 +1954,17 @@ async def save_full_health_report(
 
     ``analyzed_commit`` stamps the metric rows and the read models with the
     commit these scores were computed against; ``None`` reads as "not
-    recorded", which is honest, while a wrong sha would not be.
+    recorded", which is honest, while a wrong sha would not be. ``repo_path``
+    lets a plan whose file is gone read as deleted.
     """
     from repowise.core.persistence.crud import (
+        PayoffContext,
         finalize_performance_opportunities,
         finalize_refactoring_opportunities,
         save_health_findings,
         save_health_metrics,
         save_refactoring_suggestions,
+        write_function_facts,
     )
 
     hr = health_report
@@ -1945,6 +1999,13 @@ async def save_full_health_report(
                 for suggestion in (getattr(hr, "refactoring_suggestions", None) or [])
                 if getattr(suggestion, "refactoring_type", None) != "performance_fix"
             ],
+            # Before the facts below replace the stored ones: those are the
+            # measures a resolved plan was detected against.
+            payoff=PayoffContext(
+                fact_rows=getattr(hr, "function_facts", None),
+                is_live=path_liveness(repo_path),
+                commit=analyzed_commit,
+            ),
         )
         # Group the stored performance findings into the materialized causal
         # read model, then reconcile lifecycle and plans.
@@ -1953,11 +2014,18 @@ async def save_full_health_report(
             repo_id,
             analyzed_commit=analyzed_commit,
             plan_policy=getattr(hr, "performance_plan_policy", None),
+            execution_roles=getattr(hr, "execution_roles", None),
         )
         # Fold the plans just written into per-file opportunities. Last in the
         # savepoint because it composes over the stored rows, so it has to see
         # the reconciliation above rather than the detector output.
         await finalize_refactoring_opportunities(session, repo_id, analyzed_commit=analyzed_commit)
+        # No rows means no graph to key them on: the stored ones stay.
+        fact_rows = getattr(hr, "function_facts", None)
+        if fact_rows is not None:
+            await write_function_facts(
+                session, repo_id, fact_rows, roles=getattr(hr, "execution_roles", None)
+            )
 
 
 async def refresh_governance_findings(
@@ -2034,8 +2102,10 @@ async def persist_analysis(result: Any, session: Any, repo_id: str) -> None:
     )
 
     # ---- Dead code findings --------------------------------------------------
-    if result.dead_code_report and result.dead_code_report.findings:
-        await save_dead_code_findings(session, repo_id, result.dead_code_report.findings)
+    # Written even when empty: a run that found nothing must clear the old
+    # open rows, not leave them standing as current findings.
+    if result.dead_code_report is not None:
+        await save_dead_code_findings(session, repo_id, result.dead_code_report.findings or [])
 
     # ---- Documentation drift: findings and resolved references --------------
     # Both tables, one savepoint, one run. Written even when the finding list
@@ -2058,7 +2128,13 @@ async def persist_analysis(result: Any, session: Any, repo_id: str) -> None:
         # metric rows, so a reader can tell how far the health pass lags the
         # index instead of assuming the two moved together.
         head_sha = await _analyzed_commit(session, repo_id)
-        await save_full_health_report(session, repo_id, hr, analyzed_commit=head_sha)
+        await save_full_health_report(
+            session,
+            repo_id,
+            hr,
+            analyzed_commit=head_sha,
+            repo_path=getattr(result, "repo_path", None),
+        )
         # Resolved coverage rows, when a report was ingested this run.
         coverage_files = getattr(hr, "coverage_files", None)
         if coverage_files:

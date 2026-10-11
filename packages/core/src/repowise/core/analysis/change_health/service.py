@@ -488,6 +488,8 @@ _EXPECTED_TEXT: dict[str | None, str] = {
     "inherent_to_boundary": _INHERENT,
     "loop_already_chunked": _INHERENT,
     "gated_off": "Nothing to change while a constant-False flag switches this function off.",
+    "cold_path": "Runs once per deploy, boot or incident; not worth scheduling.",
+    "bounded_loop": "Nothing to change: the loop runs a fixed number of times.",
     None: _INHERENT,
 }
 

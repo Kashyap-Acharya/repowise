@@ -60,7 +60,7 @@ from __future__ import annotations
 import functools
 import re
 import shlex
-from collections.abc import Collection, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any
@@ -266,11 +266,14 @@ class Selection:
     names, per changed or deleted file, what decided it: ``full-run``,
     ``no-tests-needed``, ``deleted-test``, ``test-tree``, ``test-package``,
     ``conftest``, ``helper-importers``, ``coverage``,
-    ``changed-test``, ``call-graph``, ``import-graph``, ``filename-pattern``,
-    ``unknown``, ``none`` when nothing was asked (no index), or a scope's
-    ``ecosystem``, ``package-importers``, ``named-by`` or ``owner-package``.
-    ``why`` says, per selected test file, what put it in: the changed file
-    and evidence that reached it, or the reason it runs with every subset.
+    ``changed-test``, ``call-graph``, ``import-graph``, ``conftest-fixture``
+    (a test using a conftest fixture that reaches the change),
+    ``conftest-import-check`` (one test that loads a conftest the change reaches
+    only through its imports), ``filename-pattern``, ``unknown``, ``none`` when
+    nothing was asked (no index), or a scope's ``ecosystem``,
+    ``package-importers``, ``named-by`` or ``owner-package``. ``why`` says, per
+    selected test file, what put it in: the changed file and evidence that
+    reached it, or the reason it runs with every subset.
     """
 
     run_all: bool
@@ -330,20 +333,27 @@ def doc_readers(docs: Collection[str], sources: Iterable[tuple[str, str]]) -> di
     return {doc: names[0] for doc, names in file_namers(docs, sources).items()}
 
 
-def file_namers(files: Collection[str], sources: Iterable[tuple[str, str]]) -> dict[str, list[str]]:
+def file_namers(
+    files: Collection[str],
+    sources: Iterable[tuple[str, str]],
+    exact: Callable[[str], bool] | None = None,
+) -> dict[str, list[str]]:
     """``{file: the code naming it}`` for each of *files* some code or config names.
 
     Code that reads a file names it (``ROOT / "README.md"``), and a
     ``--doctest-glob`` turns every doc into a test, so the config declaring
-    one names each doc (first). One substring test per distinct file name and
-    source, and every namer is listed: a caller decides what too many means.
-    Ceiling: code that globs a directory names no file.
+    one names each doc (first). One case-insensitive substring test per
+    distinct file name and source. A file *exact* accepts is named only by a mention whose written
+    path can mean it (:mod:`~.namer_paths`); any other is
+    named by its name alone, since another asset may include it (a stylesheet
+    ``@import``) where no code names its directory. Every namer is listed: a
+    caller decides what too many means. Ceiling: code that globs a directory
+    names no file.
     """
     by_name: dict[str, list[str]] = {}
     for f in files:
         by_name.setdefault(PurePosixPath(f).name, []).append(f)
     docs = [f for f in files if PurePosixPath(f).suffix.lower() in _DOC_SUFFIXES]
-    found: dict[str, list[str]] = {}
     out: dict[str, list[str]] = {}
     for path, text in sources:
         # Config only for the glob, code only for names: pyproject's
@@ -365,6 +375,33 @@ def file_namers(files: Collection[str], sources: Iterable[tuple[str, str]]) -> d
     return {f: n for f, n in out.items() if n}
 
 
+def _named_in(
+    text: str,
+    path: str,
+    by_name: Mapping[str, list[str]],
+    exact: Callable[[str], bool] | None,
+) -> list[str]:
+    """The files of *by_name* that *path*'s *text* names (see :func:`file_namers`).
+
+    The text is scanned once per name held, whatever the number of files of
+    that name.
+    """
+    from .namer_paths import any_may_mean, mentions
+
+    out: list[str] = []
+    folded = text.lower()
+    for name, same in by_name.items():
+        if name.lower() not in folded:
+            continue
+        written = mentions(text, name) if exact and any(exact(f) for f in same) else None
+        out += [
+            f
+            for f in same
+            if f != path and (written is None or not exact(f) or any_may_mean(written, f))
+        ]
+    return out
+
+
 def plugin_loader(sources: Iterable[tuple[str, str]]) -> str | None:
     """The first conftest or pytest config that loads a plugin module by name.
 
@@ -382,6 +419,12 @@ def plugin_loader(sources: Iterable[tuple[str, str]]) -> str | None:
 PACKAGE_INIT_REASON = "every import of the package runs it, and those are not all tracked"
 
 
+# Path predicates the selection asks hundreds of thousands of times on a large
+# change (once per test per changed file); each is pure in the path.
+_PATH_MEMO = 1 << 16
+
+
+@functools.lru_cache(maxsize=_PATH_MEMO)
 def scope_kind(path: str) -> str | None:
     """``test-package`` or ``conftest`` for a file every test under its directory runs.
 
@@ -418,12 +461,13 @@ def is_runnable_test(path: str, roots: PytestRoots | None = None) -> bool:
     With *roots*, a Python file pytest's config leaves out of collection
     (``core/test_paths.py``) is not one: the same rule that stamps ``is_test``.
     """
+    return _runnable_name(path) and (roots is None or is_test_path(path, roots=roots))
+
+
+@functools.lru_cache(maxsize=_PATH_MEMO)
+def _runnable_name(path: str) -> bool:
     p = PurePosixPath(path)
-    return (
-        p.suffix.lower() in _TEST_CODE_SUFFIXES
-        and is_test_path(p.name)
-        and (roots is None or is_test_path(path, roots=roots))
-    )
+    return p.suffix.lower() in _TEST_CODE_SUFFIXES and is_test_path(p.name)
 
 
 @functools.lru_cache(maxsize=8)
@@ -588,8 +632,20 @@ def _why(
         for _, test_file in tests:
             if test_file and test_file not in out:
                 via = "coverage" if test_file in covered else vias.get(test_file, basis)
-                out[test_file] = f"{path} changed ({via})"
+                out[test_file] = f"{path} changed ({_VIA_WHY.get(via, via)})"
     return out
+
+
+# The two vias a narrowed conftest route adds (``conftest_routes``), spelled out.
+_VIA_WHY = {
+    "conftest-fixture": (
+        "conftest-fixture: it asks for a conftest fixture whose code runs into the change"
+    ),
+    "conftest-import-check": (
+        "conftest-import-check: the change reaches a conftest above it only through the "
+        "conftest's imports, and this test is that conftest's import check"
+    ),
+}
 
 
 def selected_by_change(selection: Selection, test: str) -> bool:
@@ -692,7 +748,7 @@ def _scope_tests(scope: Scope, ev: _Evidence) -> list[str]:
         return []
     return [
         t
-        for t in _under({scope.root}, ev.known_tests)
+        for t in _known_under(ev, {scope.root})
         if (not scope.suffixes or t.lower().endswith(scope.suffixes)) and t not in ev.deleted
     ]
 
@@ -757,6 +813,8 @@ def _notes(
         )
     if skipped:
         out.append(f"{len(skipped)} changed file(s) are documentation: no tests needed.")
+    # How each conftest on a route was decided (``conftest_routes``).
+    out.extend(inp.tiers.get("conftest_notes") or ())
     return out
 
 
@@ -938,6 +996,8 @@ class _Evidence:
     every_subset: frozenset[str] = frozenset()
     # Explanations that do not force a full run, gathered while deciding.
     notes: list[str] = field(default_factory=list)
+    # Known tests under each directory set (:func:`_known_under`), per selection.
+    under_memo: dict[frozenset[str], list[str]] = field(default_factory=dict, compare=False)
 
     @classmethod
     def of(cls, inp: SelectionInput, deleted: set[str]) -> _Evidence:
@@ -1042,7 +1102,16 @@ def _scope_files(path: str, found: list[_TestRef], basis: str) -> tuple[set[str]
 
 def _expand_scopes(tests: list[_TestRef], scopes: set[str], ev: _Evidence) -> list[_TestRef]:
     kept = [(t, f) for t, f in tests if f not in scopes]
-    return kept + [(t, t) for t in _tests_under(scopes, ev.known_tests) if t not in ev.deleted]
+    dirs = {str(PurePosixPath(i).parent) for i in scopes}
+    return kept + [(t, t) for t in _known_under(ev, dirs) if t not in ev.deleted]
+
+
+def _known_under(ev: _Evidence, dirs: Collection[str]) -> list[str]:
+    """Known tests below any of *dirs*, worked out once per directory set per selection."""
+    key = frozenset(dirs)
+    if key not in ev.under_memo:
+        ev.under_memo[key] = _under(key, ev.known_tests)
+    return ev.under_memo[key]
 
 
 def _own_helper_reasons(path: str, ev: _Evidence) -> list[str]:
@@ -1150,6 +1219,16 @@ def expand_test_scopes(tests: Iterable[str], test_files: Collection[str]) -> lis
     return list(out)
 
 
+_VIAS = (
+    "changed-test",
+    "call-graph",
+    "import-graph",
+    "conftest-fixture",
+    "conftest-import-check",
+    "filename-pattern",
+)
+
+
 def _basis(
     path: str,
     covered: Mapping[str, Any],
@@ -1160,7 +1239,7 @@ def _basis(
     if path in covered:
         return "coverage"
     vias = {via for _, via in inferred.get(path, ())}
-    for via in ("changed-test", "call-graph", "import-graph", "filename-pattern"):
+    for via in _VIAS:
         if via in vias:
             return via
     return "unknown" if path in unknown else "none"
@@ -1237,8 +1316,11 @@ def _pytest_args(selection: Selection) -> list[str]:
 
 def _go_args(selection: Selection) -> list[str]:
     go_tests = [f for f in selection.test_files if f.endswith("_test.go")]
-    dirs = {str(PurePosixPath(f).parent) for f in go_tests} | set(selection.packages)
-    return sorted("." if d == "." else f"./{d}" for d in dirs)
+    dirs = list(dict.fromkeys(str(PurePosixPath(f).parent) for f in go_tests))
+    for package in selection.packages:
+        if package not in dirs:
+            dirs.append(package)
+    return ["." if d == "." else f"./{d}" for d in dirs]
 
 
 def _jest_args(selection: Selection) -> list[str]:

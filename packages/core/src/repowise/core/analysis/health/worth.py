@@ -12,11 +12,13 @@ can wait and never reads as the next thing to do.
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections import defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, Literal
 
 from .complexity.dispatch import DISPATCH_SHARE
+from .complexity.terminal import TERMINAL_SHARE
 from .rows import detail_map, field
 
 #: Problem-size cut points. Each is a multiple of the detector's own bar: CCN
@@ -113,21 +115,25 @@ def dormant(facts: Mapping[str, Any]) -> bool:
     return bool(facts.get("gated_off"))
 
 
-def measure(findings: Iterable[Any]) -> dict[str, int]:
+def measure(
+    findings: Iterable[Any], details_of: Callable[[Any], Mapping[str, Any]] = detail_map
+) -> dict[str, int]:
     """A function's largest measured CCN, size and nesting across its findings.
 
     ``severe`` is set when any of them is critical or a brain method,
     ``deprecated`` when any sits in a function marked deprecated,
     ``gated_off`` when any sits in a :func:`dormant` function,
     ``dispatch_pct`` is the largest stored dispatch share in percent,
+    ``terminal_pct`` the largest stored terminal share (``complexity/terminal.py``),
     ``start`` / ``end`` span the function as its size findings place it, and
     ``deep_start`` / ``deep_end`` are its deepest nested block's lines.
+    ``details_of`` reads a finding's details, for a caller that parsed them once.
     """
     shape: dict[str, int] = {}
     for f in findings:
         if field(f, "severity") == "critical" or field(f, "biomarker_type") == "brain_method":
             shape["severe"] = 1
-        details = detail_map(f)
+        details = details_of(f)
         if details.get("deprecated"):
             shape["deprecated"] = 1
         if dormant(details):
@@ -136,9 +142,10 @@ def measure(findings: Iterable[Any]) -> dict[str, int]:
         if isinstance(deepest, dict) and deepest.get("start") and "deep_start" not in shape:
             shape["deep_start"] = int(deepest["start"])
             shape["deep_end"] = int(deepest.get("end") or deepest["start"])
-        share = details.get("dispatch_share")
-        if isinstance(share, (int, float)):
-            shape["dispatch_pct"] = max(shape.get("dispatch_pct", 0), round(share * 100))
+        for key, pct in (("dispatch_share", "dispatch_pct"), ("terminal_share", "terminal_pct")):
+            share = details.get(key)
+            if isinstance(share, (int, float)):
+                shape[pct] = max(shape.get(pct, 0), round(share * 100))
         if field(f, "biomarker_type") in SIZE_MARKERS:
             start, end = field(f, "line_start"), field(f, "line_end")
             if start and end:
@@ -153,16 +160,38 @@ def measure(findings: Iterable[Any]) -> dict[str, int]:
 
 def magnitude(shape: Mapping[str, int]) -> int:
     """How far the measured CCN, size or nesting sits past its bar, 0 to 4."""
+    # Each bar tuple is ascending, so the bars a value reaches are a bisection.
     return max(
-        sum(shape.get("ccn", 0) >= c for c in SIZE_CCN),
-        sum(shape.get("nloc", 0) >= c for c in SIZE_NLOC),
-        sum(shape.get("max_nesting", 0) >= c for c in SIZE_NESTING),
+        bisect_right(SIZE_CCN, shape.get("ccn", 0)),
+        bisect_right(SIZE_NLOC, shape.get("nloc", 0)),
+        bisect_right(SIZE_NESTING, shape.get("max_nesting", 0)),
     )
 
 
 def dispatch_shaped(shape: Mapping[str, int]) -> bool:
     """Most of the function's branching is one dispatch on one value."""
     return shape.get("dispatch_pct", 0) >= DISPATCH_SHARE * 100
+
+
+def terminal_shaped(shape: Mapping[str, int]) -> bool:
+    """The function is a print or prompt flow: a status report, a checklist,
+    a setup wizard, whose branches choose what to show."""
+    return shape.get("terminal_pct", 0) >= TERMINAL_SHARE * 100
+
+
+def measured_nloc(shape: Mapping[str, int]) -> int:
+    """The function's code lines; with none stored, its span, which bounds
+    them from above; 0 with neither."""
+    nloc = shape.get("nloc") or 0
+    if not nloc and shape.get("start") and shape.get("end"):
+        nloc = shape["end"] - shape["start"] + 1
+    return nloc
+
+
+def large_function(shape: Mapping[str, int]) -> bool:
+    """Big enough to lead on size alone: CCN 80 or 200 lines. Nesting does not
+    count here: a deep block in a short function is a small fix."""
+    return shape.get("ccn", 0) >= SIZE_CCN[2] or measured_nloc(shape) >= SIZE_NLOC[1]
 
 
 #: Nesting this share of the CCN or more is one else-if or ternary chain,
@@ -178,10 +207,7 @@ def _chained(shape: Mapping[str, int]) -> bool:
 def worth_size(shape: Mapping[str, int]) -> int:
     """:func:`magnitude` with nesting under 8 counted only in a function past
     the length bar: moderate depth in a short function is a small fix."""
-    nloc = shape.get("nloc") or 0
-    if not nloc and shape.get("start") and shape.get("end"):
-        nloc = shape["end"] - shape["start"] + 1
-    if nloc >= SIZE_NLOC[0] or shape.get("max_nesting", 0) >= SIZE_NESTING[2]:
+    if measured_nloc(shape) >= SIZE_NLOC[0] or shape.get("max_nesting", 0) >= SIZE_NESTING[2]:
         return magnitude(shape)
     return magnitude({**shape, "max_nesting": 0})
 
@@ -253,51 +279,89 @@ def finding_priorities(findings: Sequence[Any]) -> list[LowPriority | None]:
     for f in findings:
         if field(f, "function_name"):
             by_function[(field(f, "file_path"), field(f, "function_name"))].append(f)
+    # Measured once per function, not once per finding on it, and each row's
+    # details parsed once: every list tiers a repository's whole open set.
+    parsed: dict[int, Mapping[str, Any]] = {}
+
+    def details_of(f: Any) -> Mapping[str, Any]:
+        found = parsed.get(id(f))
+        if found is None:
+            found = parsed[id(f)] = detail_map(f)
+        return found
+
+    shapes = {key: measure(rows, details_of) for key, rows in by_function.items()}
     out: list[LowPriority | None] = []
     for f in findings:
         if id(f) in history:
             out.append("history")
             continue
         key = (field(f, "file_path"), field(f, "function_name"))
+        shape = shapes[key] if key in shapes else measure([f], details_of)
         out.append(
-            low_priority(
-                field(f, "biomarker_type"),
-                measure(by_function.get(key, [f])),
-                error_kind=detail_map(f).get("kind"),
-            )
+            low_priority(field(f, "biomarker_type"), shape, error_kind=details_of(f).get("kind"))
         )
     return out
 
 
 #: Performance causes that cost once per call, not once per loop iteration:
 #: they lead when an entry point reaches them.
-_PER_CALL_MARKERS = frozenset({"hot_path_sync_io", "blocking_sync_in_async", "blocking_io_under_lock"})
+_PER_CALL_MARKERS = frozenset(
+    {
+        "hot_path_sync_io",
+        "blocking_sync_in_async",
+        "blocking_io_under_lock",
+        "unbounded_read_reduced_in_memory",
+    }
+)
 #: Causes whose cost grows with the data by their shape alone.
 _GROWING_MARKERS = frozenset({"goroutine_in_unbounded_loop", "sql_cartesian_join"})
 
+CostProof = Literal["proven", "unproven"]
+COST_PROOFS: tuple[str, ...] = ("proven", "unproven")
 
-def perf_low_priority(row: Any) -> LowPriority | None:
-    """Why a performance opportunity can wait. In production code a loop cause
-    leads when its loop grows with the data, a per-call cause when an entry
-    point reaches it, and an unbounded goroutine loop or a cartesian join
-    always; the reason names whichever fact is missing."""
-    context = field(row, "execution_context")
-    if context != "production":
-        return "unknown_context" if context in (None, "unknown") else "not_production"
-    marker = field(row, "biomarker_type")
-    facets = detail_map(row).get("facets") or {}
+
+def perf_facets(row: Any) -> Mapping[str, Any]:
+    """A performance cause's facets, in memory or stored in its details."""
+    return field(row, "facets") or detail_map(row).get("facets") or {}
+
+
+def execution_role(row: Any) -> str:
+    """The role running a cause's loop: the stored column, else its facet;
+    ``unknown`` on an index stored before roles were. Which role a function
+    gets is decided in :mod:`repowise.core.analysis.execution_roles`."""
+    return field(row, "execution_role") or perf_facets(row).get("execution_role") or "unknown"
+
+
+def lead_reason(marker: str | None, facets: Mapping[str, Any]) -> LowPriority | None:
+    """Why a performance cause may not lead, or ``None`` when it may.
+
+    The one rule the performance queue, its lead, its rank and Fix first read.
+    A cause leads when its loop grows with the data, when it is a per-call
+    cause an entry point reaches, or when its shape grows by itself (an
+    unbounded goroutine loop, a cartesian join). A cause with no loop
+    (magnitude ``n/a``) is judged as a per-call one. ``unmeasured_cost`` is
+    the unproven case: nothing measured the loop, so it is a guess, not a cost.
+    """
     if marker in _GROWING_MARKERS:
         return None
-    if marker in _PER_CALL_MARKERS:
-        return None if facets.get("exposure") == "entry_reachable" else "unreached_call"
     magnitude_ = facets.get("loop_magnitude")
+    if marker in _PER_CALL_MARKERS or magnitude_ == "n/a":
+        return None if facets.get("exposure") == "entry_reachable" else "unreached_call"
     if magnitude_ == "grows_with_data":
         return None
     return "bounded_loop" if magnitude_ == "bounded" else "unmeasured_cost"
 
 
+def cost_proof(row: Any) -> CostProof:
+    """``unproven`` when nothing measured whether the cause's cost grows: kept
+    out of the default queue, listed under its own filter."""
+    reason = lead_reason(field(row, "biomarker_type"), perf_facets(row))
+    return "unproven" if reason == "unmeasured_cost" else "proven"
+
+
 __all__ = [
     "CHAIN_SHARE",
+    "COST_PROOFS",
     "EXTREME_MAGNITUDE",
     "LOW_PRIORITY_LABEL",
     "SIZE_CCN",
@@ -307,13 +371,20 @@ __all__ = [
     "TANGLED_CCN",
     "TANGLED_NESTING",
     "WORTH_MAGNITUDE",
+    "CostProof",
     "LowPriority",
+    "cost_proof",
     "dispatch_shaped",
     "dormant",
+    "execution_role",
     "finding_priorities",
+    "large_function",
+    "lead_reason",
     "low_priority",
     "magnitude",
     "measure",
-    "perf_low_priority",
+    "measured_nloc",
+    "perf_facets",
+    "terminal_shaped",
     "worth_size",
 ]
