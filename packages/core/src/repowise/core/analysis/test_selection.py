@@ -363,15 +363,13 @@ def file_namers(
                 for doc in docs:
                     out.setdefault(doc, []).insert(0, path)
             continue
-        for name in by_name:
-            if name in text:
-                found.setdefault(name, []).append(path)
-    for name, namers in found.items():
-        for f in by_name[name]:
-            out.setdefault(f, []).extend(n for n in namers if n != f)
-    # Ensure deterministic ordering of namers for each file
-    for f in out:
-        out[f].sort()
+        for f in _named_in(text, path, by_name, exact):
+            out.setdefault(f, []).append(path)
+    # Ensure deterministic ordering of namers for each file,
+    # preserving any configuration entry inserted at index 0.
+    for f, namers in out.items():
+        if len(namers) > 1:
+            out[f] = [namers[0]] + sorted(namers[1:])
     return {f: n for f, n in out.items() if n}
 
 
