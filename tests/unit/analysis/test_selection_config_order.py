@@ -54,3 +54,20 @@ def test_case_insensitive_matching() -> None:
     result = file_namers(files, sources)
     assert "README.md" in result, "Case-insensitive match should find README.md"
     assert "src/app.py" in result["README.md"]
+
+
+def test_no_config_namers_are_sorted_whatever_the_source_order() -> None:
+    """#3297's repro: package.json named only by code, no doctest-glob config.
+
+    The first namer is the one a scope quotes, so it must not follow the
+    order the sources arrive in.
+    """
+    files = ["package.json"]
+    sources = [
+        ("tests/test_pkg.py", 'Path("package.json")'),
+        ("tests/helpers.py", 'json.load(open("package.json"))'),
+        ("scripts/name.py", 'json.load(open("package.json"))'),
+    ]
+    expected = ["scripts/name.py", "tests/helpers.py", "tests/test_pkg.py"]
+    assert file_namers(files, sources)["package.json"] == expected
+    assert file_namers(files, reversed(sources))["package.json"] == expected
