@@ -359,6 +359,9 @@ def file_namers(files: Collection[str], sources: Iterable[tuple[str, str]]) -> d
     for name, namers in found.items():
         for f in by_name[name]:
             out.setdefault(f, []).extend(n for n in namers if n != f)
+    # Ensure deterministic ordering of namers for each file
+    for f in out:
+        out[f].sort()
     return {f: n for f, n in out.items() if n}
 
 
